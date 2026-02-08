@@ -14,8 +14,6 @@ st.markdown("""
 <style>
     header {visibility: hidden;}
     .block-container { padding-top: 1rem; padding-bottom: 1rem; }
-    /* 隐藏 Plotly 自带的 Modebar，让界面更像 Coinglass */
-    .modebar { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -62,144 +60,100 @@ def get_data(ticker):
     df['AHR999'] = (df['Close'] / df['GeoMean']) * (df['Close'] / df['Predicted'])
     return df
 
-# --- 3. 绘图逻辑 (Coinglass 风格) ---
+# --- 3. 绘图逻辑 (修复滑块与移除按钮) ---
 def create_chart(df_btc, df_eth):
     c_p, c_b, c_a, c_r = "#000000", "#228b22", "#4682b4", "#b22222"
     
-    # 建立双轴框架 (Row 1: Price, Row 2: Index)
-    # shared_xaxes=True 会把 Range Slider 放在最底部
+    # 1. 创建子图，开启 shared_xaxes
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05)
 
-    # --- 1. 绘制 BTC Traces (默认可见) ---
+    # 2. 绘制 BTC (Row 1 & Row 2)
     if not df_btc.empty:
-        # Price (Row 1, y)
-        fig.add_trace(go.Scatter(x=df_btc.index, y=df_btc['Close'], name="BTC Price", 
-                                 line=dict(color=c_p, width=1.5), visible=True), row=1, col=1)
-        # Model (Row 1, y)
-        fig.add_trace(go.Scatter(x=df_btc.index, y=df_btc['Predicted'], name="BTC Model", 
-                                 line=dict(color="purple", width=1, dash='dash'), visible=True), row=1, col=1)
-        # Index (Row 2, y2)
-        fig.add_trace(go.Scatter(x=df_btc.index, y=df_btc['AHR999'], name="BTC Index", 
-                                 line=dict(color="#d35400", width=1.5), visible=True), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df_btc.index, y=df_btc['Close'], name="BTC Price", line=dict(color=c_p, width=1.5), visible=True), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_btc.index, y=df_btc['Predicted'], name="BTC Model", line=dict(color="purple", width=1, dash='dash'), visible=True), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_btc.index, y=df_btc['AHR999'], name="BTC Index", line=dict(color="#d35400", width=1.5), visible=True), row=2, col=1)
 
-    # --- 2. 绘制 ETH Traces (默认隐藏，使用影子轴 y3, y4) ---
+    # 3. 绘制 ETH (影子轴, 默认隐藏)
+    # 关键点：ETH 的 X 轴必须共享主轴，不需要指定 xaxis='x2' 之类的，让它默认跟随 shared_xaxes
     if not df_eth.empty:
-        # Price (Row 1, y3 - Shadow)
-        fig.add_trace(go.Scatter(x=df_eth.index, y=df_eth['Close'], name="ETH Price", 
-                                 line=dict(color=c_p, width=1.5), yaxis="y3", visible=False), row=1, col=1) # 注意这里不需要 col/row 参数因为 yaxis="y3" 已经指定了映射
-        # Model (Row 1, y3 - Shadow)
-        fig.add_trace(go.Scatter(x=df_eth.index, y=df_eth['Predicted'], name="ETH Model", 
-                                 line=dict(color="purple", width=1, dash='dash'), yaxis="y3", visible=False))
-        # Index (Row 2, y4 - Shadow)
-        fig.add_trace(go.Scatter(x=df_eth.index, y=df_eth['AHR999'], name="ETH Index", 
-                                 line=dict(color="#d35400", width=1.5), xaxis="x2", yaxis="y4", visible=False)) # 需要指定 xaxis="x2" 对应 Row 2
+        fig.add_trace(go.Scatter(x=df_eth.index, y=df_eth['Close'], name="ETH Price", line=dict(color=c_p, width=1.5), yaxis="y3", visible=False)) # Row 1 Shadow
+        fig.add_trace(go.Scatter(x=df_eth.index, y=df_eth['Predicted'], name="ETH Model", line=dict(color="purple", width=1, dash='dash'), yaxis="y3", visible=False))
+        fig.add_trace(go.Scatter(x=df_eth.index, y=df_eth['AHR999'], name="ETH Index", line=dict(color="#d35400", width=1.5), yaxis="y4", visible=False)) # Row 2 Shadow
 
-    # --- 3. 绘制指标线 (Row 2) ---
+    # 4. 指标线
     for y_val, c, tx in [(0.45, c_b, "BUY"), (1.2, c_a, "ACCUM"), (4.0, c_r, "RISK")]:
         fig.add_hline(y=y_val, row=2, col=1, line_dash="dot", line_color=c, annotation_text=tx, annotation_position="top left", annotation_font=dict(color=c, size=10))
 
-    # --- 4. 按钮定义 (只保留币种切换) ---
+    # 5. 按钮定义 (只有 BTC/ETH 切换)
     btn_btc = dict(
-        label="Bitcoin (BTC)", method="update",
-        args=[
-            {"visible": [True, True, True, False, False, False]}, # Traces visibility
-            {
-                "title.text": f"<b>BTC-USD</b> Market Cycle",
-                "yaxis.visible": True, "yaxis2.visible": True, # BTC Axes
-                "yaxis3.visible": False, "yaxis4.visible": False # ETH Axes
-            }
-        ]
+        label="BTC", method="update",
+        args=[{"visible": [True, True, True, False, False, False]}, 
+              {"title.text": f"<b>BTC-USD</b>", "yaxis.visible": True, "yaxis2.visible": True, "yaxis3.visible": False, "yaxis4.visible": False}]
     )
-    
     btn_eth = dict(
-        label="Ethereum (ETH)", method="update",
-        args=[
-            {"visible": [False, False, False, True, True, True]}, 
-            {
-                "title.text": f"<b>ETH-USD</b> Market Cycle",
-                "yaxis.visible": False, "yaxis2.visible": False, # BTC Axes
-                "yaxis3.visible": True, "yaxis4.visible": True # ETH Axes
-            }
-        ]
+        label="ETH", method="update",
+        args=[{"visible": [False, False, False, True, True, True]}, 
+              {"title.text": f"<b>ETH-USD</b>", "yaxis.visible": False, "yaxis2.visible": False, "yaxis3.visible": True, "yaxis4.visible": True}]
     )
 
-    # --- 5. 布局核心设置 ---
+    # 6. 布局设置 (核心修复区)
     fig.update_layout(
         template="plotly_white",
-        height=700, # 稍微高一点以容纳 Slider
-        margin=dict(t=80, l=40, r=40, b=40), # 顶部留出标题空间
-        title=dict(text=f"<b>BTC-USD</b> Market Cycle", x=0.01, y=0.96, font=dict(size=20)),
+        height=700,
+        margin=dict(t=80, l=40, r=40, b=40),
+        title=dict(text="<b>BTC-USD</b>", x=0.01, y=0.96),
         hovermode="x unified",
         showlegend=False,
-        dragmode="pan", # 默认拖拽模式为平移
+        dragmode="pan", # 鼠标左键默认平移，而非缩放框选
         
-        # 顶部按钮组
-        updatemenus=[
-            dict(
-                type="buttons",
-                direction="left",
-                active=0,
-                x=0.01, y=1.08, # 放在标题上方
-                buttons=[btn_btc, btn_eth],
-                bgcolor="white", bordercolor="#e0e0e0", borderwidth=1,
-                font=dict(size=12)
-            )
-        ],
+        updatemenus=[dict(
+            type="buttons", direction="left", active=0, x=0.01, y=1.08,
+            buttons=[btn_btc, btn_eth], bgcolor="white", bordercolor="#e0e0e0", borderwidth=1
+        )],
         
-        # --- 关键：X轴与 Range Slider 设置 ---
+        # --- X轴配置：这是修复的关键 ---
         xaxis=dict(
-            anchor="y2", # 锚定到底部图表
+            anchor="y2", # 确保对齐
             type="date",
+            fixedrange=False, # 必须为 False，否则滑块拖不动
+            
+            # 1. 强制启用滑块
             rangeslider=dict(
-                visible=True, # 开启滑块
-                thickness=0.08, # 滑块高度占比
-                bgcolor="#f8f9fa", # 滑块背景色
-                bordercolor="#dee2e6",
-                borderwidth=1
+                visible=True, 
+                thickness=0.08,
+                bgcolor="#f4f4f4"
             ),
-            rangeselector=dict(visible=False) # 彻底禁用原生的 rangeselector 按钮
+            
+            # 2. 强制关闭按钮 (1W, 1M, etc)
+            rangeselector=dict(visible=False) 
         ),
         
-        # --- Y轴设置 (BTC) ---
-        yaxis=dict(
-            domain=[0.35, 1], # 上半部分 65%
-            type="log", title="Price (USD)", 
-            fixedrange=False, # 允许纵向缩放 (虽然 Rangeslider 不会自动触发)
-            showgrid=True, gridcolor="#f0f0f0"
-        ),
-        yaxis2=dict(
-            domain=[0, 0.30], # 下半部分 30%
-            type="log", title="Index",
-            showgrid=True, gridcolor="#f0f0f0"
-        ),
-
-        # --- Y轴设置 (ETH - 影子轴) ---
-        # 必须与 BTC 的 domain 完全一致，且 overlaying 对应轴
-        yaxis3=dict(
-            domain=[0.35, 1], anchor="x", overlaying="y", side="left",
-            type="log", title="Price (USD)", visible=False, showgrid=False
-        ),
-        yaxis4=dict(
-            domain=[0, 0.30], anchor="x", overlaying="y2", side="left",
-            type="log", title="Index", visible=False, showgrid=False
-        )
+        # --- Y轴配置 (保持 Log 模式以适应无自动缩放) ---
+        yaxis=dict(domain=[0.35, 1], type="log", title="Price", fixedrange=False),
+        yaxis2=dict(domain=[0, 0.30], type="log", title="Index", fixedrange=False),
+        
+        # --- 影子轴配置 ---
+        yaxis3=dict(domain=[0.35, 1], anchor="x", overlaying="y", side="left", type="log", visible=False, showgrid=False),
+        yaxis4=dict(domain=[0, 0.30], anchor="x", overlaying="y2", side="left", type="log", visible=False, showgrid=False)
     )
 
     return fig
 
 # --- 4. 主程序 ---
 st.title("Market Cycle Monitor")
-with st.spinner("Loading market data..."):
+with st.spinner("Loading..."):
     btc_df, eth_df = get_data("BTC-USD"), get_data("ETH-USD")
 
 if not btc_df.empty:
     fig = create_chart(btc_df, eth_df)
-    # config 中移除多余按钮，保持界面清爽
+    
+    # 彻底禁用 displayModeBar 中的按钮，只留纯图表
     st.plotly_chart(fig, use_container_width=True, 
                     config={
-                        'displayModeBar': False, # 隐藏顶部工具栏
-                        'scrollZoom': True,      # 允许滚轮缩放
-                        'showAxisRangeEntryBoxes': False
+                        'displayModeBar': False,  # 隐藏顶部悬浮工具栏
+                        'scrollZoom': True,       # 允许滚轮缩放
+                        'doubleClick': 'reset',   # 双击重置
+                        'showAxisRangeEntryBoxes': False # 禁用输入框
                     })
 else:
-    st.error("Data loading failed.")
+    st.error("No Data")
