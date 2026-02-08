@@ -8,16 +8,18 @@ from plotly.subplots import make_subplots
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
-# --- 页面配置 ---
+# --- 1. 页面配置 ---
 st.set_page_config(page_title="Market Cycle Monitor", layout="wide")
 st.markdown("""
 <style>
     header {visibility: hidden;}
     .block-container { padding-top: 1rem; padding-bottom: 1rem; }
+    /* 隐藏 Plotly 的 Modebar (右上角工具栏) */
+    .modebar {display: none !important;}
 </style>
 """, unsafe_allow_html=True)
 
-# --- 数据获取 (包含防错机制) ---
+# --- 2. 数据获取 (保持健壮性) ---
 def fetch_coingecko(ticker):
     try:
         coin = "bitcoin" if "BTC" in ticker else "ethereum"
@@ -63,7 +65,7 @@ def get_data(ticker):
     df['AHR999'] = (df['Close'] / df['GeoMean']) * (df['Close'] / df['Predicted'])
     return df
 
-# --- 绘图逻辑 (修复 step 参数) ---
+# --- 3. 绘图逻辑 (修复按钮与交互) ---
 def create_chart(df_btc, df_eth):
     c_price, c_buy, c_acc, c_sell = "#000000", "#228b22", "#4682b4", "#b22222"
     
@@ -89,8 +91,11 @@ def create_chart(df_btc, df_eth):
     for y_val, color, txt in zones:
         fig.add_hline(y=y_val, row=2, col=1, line_dash="dot", line_color=color, annotation_text=txt, annotation_font=dict(color=color))
 
-    # 布局配置
+    # --- 布局配置 ---
     fig.update_layout(
+        # 1. 禁用全局拖拽模式，鼠标变回普通箭头
+        dragmode=False,
+        
         updatemenus=[dict(
             type="buttons", direction="left", active=0, x=0, y=1.12,
             buttons=[
@@ -104,18 +109,15 @@ def create_chart(df_btc, df_eth):
         margin=dict(t=110, l=40, r=40, b=40),
         title=dict(text=get_title(df_btc, "BTC-USD"), x=0, y=0.98),
         showlegend=False,
-        
-        # 允许鼠标缩放Y轴 (关键)
-        yaxis=dict(fixedrange=False, autorange=True), 
-        yaxis2=dict(fixedrange=False, autorange=True)
     )
 
-    # 修复 range selector：使用 day 替代 week
+    # --- 修复 Time Buttons (使用 day + count) ---
     fig.update_xaxes(
         rangeselector=dict(
             buttons=list([
-                dict(count=7, label="1W", step="day", stepmode="backward"),   # 修正点：7天
-                dict(count=14, label="2W", step="day", stepmode="backward"),  # 修正点：14天
+                # 修复点：使用 'day' 配合 count=7 来表示一周
+                dict(count=7, label="1W", step="day", stepmode="backward"),
+                dict(count=14, label="2W", step="day", stepmode="backward"),
                 dict(count=1, label="1M", step="month", stepmode="backward"),
                 dict(count=6, label="6M", step="month", stepmode="backward"),
                 dict(count=1, label="1Y", step="year", stepmode="backward"),
@@ -125,15 +127,20 @@ def create_chart(df_btc, df_eth):
             x=1, xanchor="right", y=1.12,
             font=dict(size=11)
         ),
+        # 锁定 X 轴交互 (禁止左右拖拽)
+        fixedrange=True,
         row=1, col=1
     )
 
-    fig.update_yaxes(type="log", title="USD (Log)", row=1, col=1)
-    fig.update_yaxes(type="log", title="Index (Log)", row=2, col=1)
+    # --- 坐标轴设置 ---
+    # 关键：Y 轴必须 fixedrange=False (允许自动缩放)，否则 Log 坐标下短周期全是直线
+    # autorange=True 会让 Plotly 尽力去适配当前视野
+    fig.update_yaxes(type="log", title="USD (Log)", row=1, col=1, fixedrange=False, autorange=True)
+    fig.update_yaxes(type="log", title="Index (Log)", row=2, col=1, fixedrange=False, autorange=True)
     
     return fig
 
-# --- 主程序 ---
+# --- 4. 主程序 ---
 st.title("Market Cycle Monitor")
 
 with st.spinner("Syncing data..."):
@@ -142,6 +149,11 @@ with st.spinner("Syncing data..."):
 
 if not btc.empty:
     fig = create_chart(btc, eth)
-    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False, 'scrollZoom': True})
+    # config 配置：
+    # scrollZoom=False: 禁用滚轮缩放
+    # displayModeBar=False: 隐藏右上角工具栏
+    # staticPlot=False: 必须为 False 才能让按钮点击生效
+    st.plotly_chart(fig, use_container_width=True, 
+                    config={'displayModeBar': False, 'scrollZoom': False, 'staticPlot': False})
 else:
     st.error("Data Load Error")
