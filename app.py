@@ -14,15 +14,13 @@ st.markdown("""
 <style>
     header {visibility: hidden;}
     .block-container { padding-top: 1rem; padding-bottom: 1rem; }
-    .modebar {display: none !important;}
 </style>
 """, unsafe_allow_html=True)
 
-# --- 2. 数据获取 ---
+# --- 2. 数据获取 (保持不变) ---
 @st.cache_data(ttl=3600)
 def get_data(ticker):
     df = pd.DataFrame()
-    # 尝试 Yahoo
     try:
         raw = yf.download(ticker, period="max", interval="1d", progress=False)
         if not raw.empty:
@@ -34,7 +32,6 @@ def get_data(ticker):
             if'Close' not in df.columns: df = df.iloc[:, 0].to_frame('Close')
     except: pass
 
-    # 尝试 Coingecko
     if df.empty:
         try:
             coin = "bitcoin" if "BTC" in ticker else "ethereum"
@@ -47,11 +44,9 @@ def get_data(ticker):
 
     if df.empty: return df
     
-    # 清洗数据
     if df.index.tz is not None: df.index = df.index.tz_localize(None)
     df = df[pd.to_numeric(df['Close'], errors='coerce') > 0]
     
-    # 指标计算
     df['GeoMean'] = np.exp(np.log(df['Close']).rolling(200).mean())
     df['Days'] = (df.index - pd.Timestamp("2009-01-03")).days
     df = df[df['Days'] > 0].dropna()
@@ -65,129 +60,175 @@ def get_data(ticker):
     df['AHR999'] = (df['Close'] / df['GeoMean']) * (df['Close'] / df['Predicted'])
     return df
 
-# --- 3. 绘图逻辑 (核心修改) ---
+# --- 3. 核心修复逻辑：预计算与影子坐标轴 ---
 def create_chart(df_btc, df_eth):
+    # 定义颜色
     c_p, c_b, c_a, c_r = "#000000", "#228b22", "#4682b4", "#b22222"
     
-    # 辅助函数：获取标题
-    def get_t(df, n):
-        if df.empty: return f"{n}: No Data"
-        return f"<b>{n}</b>: ${df['Close'].iloc[-1]:,.2f} | Index: {df['AHR999'].iloc[-1]:.4f}"
+    # 确保我们有最新的日期作为基准
+    last_date = pd.Timestamp.now()
+    if not df_btc.empty: last_date = df_btc.index[-1]
+    elif not df_eth.empty: last_date = df_eth.index[-1]
 
-    # 1. 计算时间范围 (基于数据真实存在的最后一天)
-    # 我们以 BTC 的时间为基准，如果 BTC 没数据则用 ETH，都为空则用今天
-    ref_df = df_btc if not df_btc.empty else (df_eth if not df_eth.empty else pd.DataFrame())
-    
-    if not ref_df.empty:
-        last_date = ref_df.index[-1]
-    else:
-        # 如果完全没数据，无需渲染后续
-        return go.Figure()
+    # --- 辅助函数：计算特定时间窗口下的 Log Y轴范围 ---
+    # Log坐标轴的 Range 必须是 [log10(min), log10(max)]
+    def get_log_range(df, days_back, col='Close', padding=0.05):
+        if df.empty: return [0, 1]
+        
+        if days_back == 0: # ALL
+            target_df = df
+        else:
+            start_date = last_date - timedelta(days=days_back)
+            target_df = df[df.index >= start_date]
+        
+        if target_df.empty: return [0, 1]
+        
+        val_min = target_df[col].min()
+        val_max = target_df[col].max()
+        
+        # 防止无效数据
+        if val_min <= 0 or pd.isna(val_min): val_min = 1
+        if val_max <= 0 or pd.isna(val_max): val_max = 10
+        
+        # 转换为 Log10 并添加 Padding
+        log_min = np.log10(val_min)
+        log_max = np.log10(val_max)
+        diff = log_max - log_min
+        if diff == 0: diff = 0.1
+        
+        return [log_min - diff * padding, log_max + diff * padding]
 
-    # 预计算各个时间窗口的开始日期 (转为字符串给 Plotly 用)
-    d_max = last_date
-    d_1w = d_max - timedelta(days=7)
-    d_2w = d_max - timedelta(days=14)
-    d_1m = d_max - timedelta(days=30)
-    d_3m = d_max - timedelta(days=90)
-    d_6m = d_max - timedelta(days=180)
-    d_1y = d_max - timedelta(days=365)
-    d_3y = d_max - timedelta(days=365*3)
-
-    # 2. 创建图表
+    # --- 创建图表结构 ---
+    # Rows=2, Cols=1. 默认 Plotly 会创建 y (row1) 和 y2 (row2)
+    # 我们将手动添加 y3 (row1, overlay y) 和 y4 (row2, overlay y2) 给 ETH 使用
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.65, 0.35], vertical_spacing=0.03)
 
-    # 3. 绘制 Traces
-    for df, vis, name in [(df_btc, True, "BTC"), (df_eth, False, "ETH")]:
-        d = df if not df.empty else pd.DataFrame({'Close':[],'Predicted':[],'AHR999':[]})
-        fig.add_trace(go.Scatter(x=d.index, y=d['Close'], name="Price", line=dict(color=c_p, width=1.5), visible=vis), row=1, col=1)
-        fig.add_trace(go.Scatter(x=d.index, y=d['Predicted'], name="Model", line=dict(color="purple", width=1, dash='dash'), visible=vis), row=1, col=1)
-        fig.add_trace(go.Scatter(x=d.index, y=d['AHR999'], name="Index", line=dict(color="#d35400", width=1.5), visible=vis), row=2, col=1)
+    # --- 绘制 BTC Traces (关联 y 和 y2) ---
+    # Visible 初始设为 True
+    if not df_btc.empty:
+        fig.add_trace(go.Scatter(x=df_btc.index, y=df_btc['Close'], name="BTC Price", line=dict(color=c_p, width=1.5), visible=True), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_btc.index, y=df_btc['Predicted'], name="BTC Model", line=dict(color="purple", width=1, dash='dash'), visible=True), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_btc.index, y=df_btc['AHR999'], name="BTC Index", line=dict(color="#d35400", width=1.5), visible=True), row=2, col=1)
 
-    # 4. 绘制背景区域
-    for y, c, tx in [(0.45, c_b, "BUY"), (1.2, c_a, "ACCUM"), (4.0, c_r, "RISK")]:
-        fig.add_hline(y=y, row=2, col=1, line_dash="dot", line_color=c, annotation_text=tx, annotation_font=dict(color=c))
+    # --- 绘制 ETH Traces (关联 y3 和 y4) ---
+    # Visible 初始设为 False
+    # 注意：yaxis='y3' 是特殊的映射方式
+    if not df_eth.empty:
+        fig.add_trace(go.Scatter(x=df_eth.index, y=df_eth['Close'], name="ETH Price", line=dict(color=c_p, width=1.5), yaxis="y3", visible=False)) # Row 1 Shadow
+        fig.add_trace(go.Scatter(x=df_eth.index, y=df_eth['Predicted'], name="ETH Model", line=dict(color="purple", width=1, dash='dash'), yaxis="y3", visible=False)) # Row 1 Shadow
+        fig.add_trace(go.Scatter(x=df_eth.index, y=df_eth['AHR999'], name="ETH Index", line=dict(color="#d35400", width=1.5), xaxis="x2", yaxis="y4", visible=False)) # Row 2 Shadow
 
-    # 5. 定义 Updatemenus (按钮组)
-    # 左侧：切换币种
-    # 右侧：切换时间 (手动计算 range，不依赖 rangeselector)
+    # --- 绘制背景线 (Row 2) ---
+    # 为了简化，背景线画在 y2 上，反正阈值对两个币差不多
+    for y_val, c, tx in [(0.45, c_b, "BUY"), (1.2, c_a, "ACCUM"), (4.0, c_r, "RISK")]:
+        fig.add_hline(y=y_val, row=2, col=1, line_dash="dot", line_color=c, annotation_text=tx, annotation_font=dict(color=c))
+
+    # --- 核心：生成“智能”时间按钮 ---
+    # 每个按钮都会同时设置 BTC 的轴范围和 ETH 的轴范围
+    time_periods = [
+        ("1W", 7), ("2W", 14), ("1M", 30), ("3M", 90), 
+        ("6M", 180), ("1Y", 365), ("3Y", 365*3), ("ALL", 0)
+    ]
     
-    # 币种切换逻辑
-    button_btc = dict(label="BTC", method="update", args=[{"visible": [True, True, True, False, False, False]}, {"title.text": get_t(df_btc, "BTC-USD")}])
-    button_eth = dict(label="ETH", method="update", args=[{"visible": [False, False, False, True, True, True]}, {"title.text": get_t(df_eth, "ETH-USD")}])
+    buttons_time = []
+    for label, days in time_periods:
+        # 1. 计算 X 轴范围
+        if days == 0:
+            x_range = [None, None] # Autorange for X
+        else:
+            x_start = last_date - timedelta(days=days)
+            x_range = [x_start.strftime("%Y-%m-%d"), last_date.strftime("%Y-%m-%d")]
+            
+        # 2. 预计算 BTC 的 Y轴范围 (Price & Index)
+        btc_p_range = get_log_range(df_btc, days, 'Close')
+        btc_i_range = get_log_range(df_btc, days, 'AHR999')
+        
+        # 3. 预计算 ETH 的 Y轴范围 (Price & Index)
+        eth_p_range = get_log_range(df_eth, days, 'Close')
+        eth_i_range = get_log_range(df_eth, days, 'AHR999')
+        
+        # 4. 构建 Args：一次性更新所有轴
+        # 注意：yaxis 是 BTC Price, yaxis3 是 ETH Price
+        #       yaxis2 是 BTC Index, yaxis4 是 ETH Index
+        args_dict = {
+            "xaxis.range": x_range,
+            "yaxis.range": btc_p_range,  # BTC Price Range
+            "yaxis3.range": eth_p_range, # ETH Price Range
+            "yaxis2.range": btc_i_range, # BTC Index Range
+            "yaxis4.range": eth_i_range, # ETH Index Range
+        }
+        
+        # 如果是 ALL，让 Plotly 自动处理
+        if days == 0:
+            args_dict = {
+                "xaxis.autorange": True,
+                "yaxis.autorange": True, "yaxis3.autorange": True,
+                "yaxis2.autorange": True, "yaxis4.autorange": True
+            }
 
-    # 时间切换逻辑 (核心修复)
-    # 强制设置 xaxis.range 和 yaxis.autorange
-    def time_btn(label, start_date):
-        return dict(
+        buttons_time.append(dict(
             label=label,
             method="relayout",
-            args=[{
-                "xaxis.range": [start_date, d_max], 
-                "xaxis.autorange": False,
-                "yaxis.autorange": True,  # 强制 Y 轴重置
-                "yaxis2.autorange": True
-            }]
-        )
-    
-    time_buttons = [
-        time_btn("1W", d_1w),
-        time_btn("2W", d_2w),
-        time_btn("1M", d_1m),
-        time_btn("3M", d_3m),
-        time_btn("6M", d_6m),
-        time_btn("1Y", d_1y),
-        time_btn("3Y", d_3y),
-        dict(label="ALL", method="relayout", args=[{"xaxis.autorange": True, "yaxis.autorange": True, "yaxis2.autorange": True}])
-    ]
+            args=[args_dict]
+        ))
 
+    # --- 生成币种切换按钮 ---
+    # 这里需要非常小心地控制 trace 的可见性和 axis 的可见性
+    # Traces 顺序: 
+    # 0,1,2 -> BTC (Price, Model, Index)
+    # 3,4,5 -> ETH (Price, Model, Index)
+    
+    # 切换到 BTC: 显示 Trace 0-2, 隐藏 3-5; 显示 y/y2, 隐藏 y3/y4
+    btn_btc = dict(
+        label="BTC", method="update",
+        args=[
+            {"visible": [True, True, True, False, False, False]}, # Traces
+            {
+                "title.text": f"<b>BTC-USD</b>: ${df_btc['Close'].iloc[-1]:,.2f} | Index: {df_btc['AHR999'].iloc[-1]:.4f}",
+                "yaxis.visible": True, "yaxis2.visible": True,
+                "yaxis3.visible": False, "yaxis4.visible": False
+            }
+        ]
+    )
+    
+    # 切换到 ETH: 显示 Trace 3-5, 隐藏 0-2; 隐藏 y/y2, 显示 y3/y4
+    last_eth_price = df_eth['Close'].iloc[-1] if not df_eth.empty else 0
+    last_eth_idx = df_eth['AHR999'].iloc[-1] if not df_eth.empty else 0
+    btn_eth = dict(
+        label="ETH", method="update",
+        args=[
+            {"visible": [False, False, False, True, True, True]}, # Traces
+            {
+                "title.text": f"<b>ETH-USD</b>: ${last_eth_price:,.2f} | Index: {last_eth_idx:.4f}",
+                "yaxis.visible": False, "yaxis2.visible": False,
+                "yaxis3.visible": True, "yaxis4.visible": True
+            }
+        ]
+    )
+
+    # --- 布局设置 ---
     fig.update_layout(
-        # 禁用交互
-        dragmode=False,
-        
-        updatemenus=[
-            # 左侧按钮组：BTC / ETH
-            dict(
-                type="buttons", direction="left", active=0, x=0, y=1.12,
-                buttons=[button_btc, button_eth],
-                bgcolor="white", bordercolor="#cccccc", borderwidth=1
-            ),
-            # 右侧按钮组：时间选择 (替代了 rangeselector)
-            dict(
-                type="buttons", direction="left", active=7, x=1, y=1.12, xanchor="right",
-                buttons=time_buttons,
-                bgcolor="white", bordercolor="#cccccc", borderwidth=1,
-                font=dict(size=10) # 缩小字体防止拥挤
-            )
-        ],
-        
-        hovermode="x unified",
         template="plotly_white",
         height=750,
         margin=dict(t=110, l=40, r=40, b=40),
-        title=dict(text=get_t(df_btc, "BTC-USD"), x=0, y=0.98),
+        title=dict(text=f"<b>BTC-USD</b>: ${df_btc['Close'].iloc[-1]:,.2f} | Index: {df_btc['AHR999'].iloc[-1]:.4f}", x=0, y=0.98),
+        hovermode="x unified",
         showlegend=False,
-    )
-
-    # 6. 坐标轴设置
-    # X轴：锁死交互
-    fig.update_xaxes(fixedrange=True, row=1, col=1) 
-    fig.update_xaxes(fixedrange=True, row=2, col=1)
-
-    # Y轴：解锁 fixedrange (为了 autorange 生效)，但因为 dragmode=False，用户依然无法手动拖拽
-    fig.update_yaxes(type="log", title="USD", row=1, col=1, fixedrange=False)
-    fig.update_yaxes(type="log", title="Index", row=2, col=1, fixedrange=False)
-    
-    return fig
-
-# --- 4. 主程序 ---
-st.title("Market Cycle Monitor")
-with st.spinner("Syncing data..."):
-    btc_df, eth_df = get_data("BTC-USD"), get_data("ETH-USD")
-
-if not btc_df.empty:
-    fig = create_chart(btc_df, eth_df)
-    # 彻底禁用 Streamlit 端的交互配置
-    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False, 'scrollZoom': False, 'staticPlot': False})
-else:
-    st.error("Unable to load data.")
+        dragmode="pan", # 允许拖拽
+        
+        # 按钮容器
+        updatemenus=[
+            dict(
+                type="buttons", direction="left", active=0, x=0, y=1.12,
+                buttons=[btn_btc, btn_eth],
+                bgcolor="white", bordercolor="#cccccc", borderwidth=1
+            ),
+            dict(
+                type="buttons", direction="left", active=7, x=1, y=1.12, xanchor="right",
+                buttons=buttons_time,
+                bgcolor="white", bordercolor="#cccccc", borderwidth=1,
+                font=dict(size=10)
+            )
+        ],
+        
+        # --- 复杂
