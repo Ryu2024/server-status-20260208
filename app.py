@@ -2,278 +2,239 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import requests  # 新增：用于请求备用接口
+import requests
 from scipy.stats import linregress
 from plotly.subplots import make_subplots
 import plotly.graph_objects as go
+from datetime import datetime, timedelta
 
-# --- 1. 页面配置 ---
-st.set_page_config(page_title="Crypto Dashboard Pro", layout="wide")
+# --- 1. 全局页面配置 ---
+st.set_page_config(
+    page_title="Market Cycle Monitor",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# --- 2. 增强型数据获取模块 (双通道) ---
+# --- 2. 样式美化 (CSS) ---
+# 隐藏 Streamlit 默认的汉堡菜单和页脚，使界面更像原生 App
+st.markdown("""
+<style>
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    .stApp {
+        background-color: #f8f9fa;
+    }
+    div.block-container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+    }
+    /* 调整滑块样式 */
+    .stSlider > div > div > div > div {
+        background-color: #2c3e50;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# --- 3. 稳健的数据获取 (双通道: Yahoo + Coingecko) ---
+# 保持之前的稳健逻辑，确保有网就能跑
 
 def fetch_coingecko_data(ticker):
-    """
-    备用通道：从 Coingecko 获取历史数据 (无需 Key，真实数据)
-    """
-    # 映射 Ticker 到 Coingecko ID
     coin_id = "bitcoin" if "BTC" in ticker else "ethereum"
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-    
-    # 请求参数：对美元，最大时间跨度，按天
-    params = {
-        'vs_currency': 'usd',
-        'days': 'max',
-        'interval': 'daily'
-    }
-    
+    params = {'vs_currency': 'usd', 'days': 'max', 'interval': 'daily'}
     try:
-        # 增加 User-Agent 伪装，防止被识别为爬虫
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        headers = {'User-Agent': 'Mozilla/5.0'}
         response = requests.get(url, params=params, headers=headers, timeout=10)
         data = response.json()
-        
-        if'prices' not in data:
-            return pd.DataFrame()
-            
-        # Coingecko 返回的是 [[timestamp, price], ...]
+        if'prices' not in data: return pd.DataFrame()
         df = pd.DataFrame(data['prices'], columns=['timestamp', 'Close'])
         df['Date'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('Date', inplace=True)
-        df.drop(columns=['timestamp'], inplace=True)
-        
-        # 简单清洗
-        df = df[~df.index.duplicated(keep='last')]
-        return df
-        
-    except Exception as e:
-        print(f"Coingecko fallback failed: {e}")
-        return pd.DataFrame()
+        return df[['Close']]
+    except: return pd.DataFrame()
 
-@st.cache_data(ttl=600) # 缓存10分钟
-def get_robust_data(ticker):
-    """
-    智能路由数据获取：优先 Yahoo，失败则自动切换 Coingecko
-    """
-    df = pd.DataFrame()
-    source_used = "Yahoo"
-    
-    # --- 通道 1: Yahoo Finance ---
+@st.cache_data(ttl=3600)
+def get_data(ticker):
+    source = "Yahoo Finance"
     try:
-        # 尝试使用 Ticker 对象，有时比 download 更稳定
-        dat = yf.Ticker(ticker)
-        df = dat.history(period="max")
-        
-        if df.empty:
-            raise ValueError("Yahoo returned empty data")
-            
-    except Exception as e_yahoo:
-        # --- 通道 2: Coingecko (Failover) ---
-        print(f"Yahoo failed ({e_yahoo}), switching to Coingecko...")
-        try:
-            df = fetch_coingecko_data(ticker)
-            source_used = "Coingecko"
-        except Exception as e_cg:
-            print(f"All sources failed: {e_cg}")
-    
-    return df, source_used
-
-def calculate_metrics(ticker):
-    """数据计算与清洗逻辑"""
-    raw_df, source = get_robust_data(ticker)
-    
-    if raw_df.empty:
-        return raw_df, f"Error: Data Unavailable ({ticker})", 0, 0, "N/A"
-
-    # 标准化列名 (兼容不同来源)
-    if'Close' not in raw_df.columns:
-        # 模糊匹配
-        cols = [c for c in raw_df.columns if'Close' in str(c)]
-        if cols:
-            raw_df = raw_df[[cols[0]]].rename(columns={cols[0]: 'Close'})
+        df = yf.download(ticker, period="max", interval="1d", progress=False)
+        if df.empty: raise ValueError("Empty")
+        # 兼容 yfinance 新旧版本列名差异
+        if isinstance(df.columns, pd.MultiIndex):
+            df = df.xs('Close', axis=1, level=0, drop_level=True)
+        if'Close' not in df.columns and len(df.columns) >= 1:
+             # 假设第一列是 Close
+             df = df.iloc[:, 0].to_frame(name='Close')
         else:
-            return pd.DataFrame(), "Column Error", 0, 0, "Error"
-
-    df = raw_df[['Close']].copy().sort_index()
-    if df.index.tz is not None: df.index = df.index.tz_localize(None)
-    df = df[df['Close'] > 0].dropna()
+            df = df[['Close']]
+    except:
+        df = fetch_coingecko_data(ticker)
+        source = "Coingecko (Backup)"
     
-    # 核心指标计算
+    if df.empty: return df, "Data Error"
+
+    # --- 指标计算逻辑 ---
+    df = df.sort_index()
+    if df.index.tz is not None: df.index = df.index.tz_localize(None)
+    df = df[df['Close'] > 0]
+    
+    # 200日定投几何平均成本
     df['Log_Price'] = np.log(df['Close'])
     df['GeoMean'] = np.exp(df['Log_Price'].rolling(window=200).mean())
     
-    genesis_date = pd.Timestamp("2009-01-03")
-    df['Days'] = (df.index - genesis_date).days
-    df = df[df['Days'] > 0]
-
-    # 预测模型
+    # 币龄与回归预测
+    genesis = pd.Timestamp("2009-01-03")
+    df['Days'] = (df.index - genesis).days
+    df = df[df['Days'] > 0].dropna()
+    
     if "BTC" in ticker:
-        slope = 5.84
-        intercept = -17.01
-        log_days = np.log10(df['Days'])
-        df['Predicted'] = 10 ** (slope * log_days + intercept)
-        note = f"Source: {source} | Model: Power Law"
+        # BTC 使用经典的囤币党参数
+        slope, intercept = 5.84, -17.01
+        df['Predicted'] = 10 ** (slope * np.log10(df['Days']) + intercept)
     else:
-        # ETH 动态回归
-        valid_data = df.dropna()
-        if len(valid_data) > 10:
-            x = np.log10(valid_data['Days'].values)
-            y = np.log10(valid_data['Close'].values)
-            slope, intercept, _, _, _ = linregress(x, y)
-            df['Predicted'] = 10 ** (intercept + slope * np.log10(df['Days']))
-            note = f"Source: {source} | Model: Reg (Beta {slope:.2f})"
-        else:
-            df['Predicted'] = np.nan
-            note = f"Source: {source} | Data Insufficient"
+        # ETH 使用动态回归
+        x = np.log10(df['Days'].values)
+        y = np.log10(df['Close'].values)
+        slope, intercept, _, _, _ = linregress(x, y)
+        df['Predicted'] = 10 ** (intercept + slope * x)
 
-    # AHR999 / 偏离度
+    # AHR999 指数
     df['AHR999'] = (df['Close'] / df['GeoMean']) * (df['Close'] / df['Predicted'])
-    
-    # 最新状态
-    last_row = df.iloc[-1]
-    current_price = last_row['Close']
-    current_ahr = last_row['AHR999'] if not np.isnan(last_row['AHR999']) else 0
-    
-    return df, note, current_price, current_ahr
+    return df, source
 
-@st.cache_data(ttl=3600)
-def load_all_market_data():
-    """一次性加载所有数据"""
-    data_map = {}
-    tickers = ["BTC-USD", "ETH-USD"]
+# --- 4. 可视化核心 (静态 + 易懂) ---
+def create_static_dashboard(df, ticker, start_date, end_date):
+    # 1. 数据切片
+    mask = (df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))
+    df_slice = df.loc[mask]
     
-    for t in tickers:
-        df, note, price, ahr = calculate_metrics(t)
-        
-        state_text = "ZONE H (High)"
-        color_hex = "#dc3545" 
-        
-        if ahr < 0.45: 
-            state_text = "ZONE L (Buy)"
-            color_hex = "#28a745"
-        elif 0.45 <= ahr <= 1.2: 
-            state_text = "ZONE M (Accum)"
-            color_hex = "#007bff"
-        elif 1.2 < ahr <= 4.0: 
-            state_text = "ZONE N (Hold)"
-            color_hex = "#fd7e14"
-        
-        data_map[t] = {
-            "df": df, "note": note, "price": price, 
-            "ahr": ahr, "state": state_text, "color": color_hex
-        }
-    return data_map
+    if df_slice.empty:
+        st.error("Selected time range has no data.")
+        return
 
-# --- 3. 生成 HTML 标题 (保持原有 UI 设计) ---
-def generate_header_html(ticker_name, data_dict):
-    if not data_dict or data_dict['df'].empty: return "DATA LOADING FAILED"
-    
-    price = data_dict['price']
-    ahr = data_dict['ahr']
-    state = data_dict['state']
-    color = data_dict['color']
-    note = data_dict['note']
-    
-    return f"""
-    <span style="font-family: 'Courier New'; font-size: 24px; font-weight: bold;">{ticker_name} DASHBOARD</span><br>
-    <span style="font-size: 14px; color: #555;">{note}</span><br><br>
-    
-    <span style="font-size: 16px; color: #666;">CURRENT PRICE: </span>
-    <span style="font-size: 20px; font-weight: bold;">${price:,.2f}</span>
-    &nbsp;&nbsp;|&nbsp;&nbsp;
-    <span style="font-size: 16px; color: #666;">DEVIATION INDEX: </span>
-    <span style="font-size: 20px; font-weight: bold; color: {color};">{ahr:.4f}</span>
-    &nbsp;&nbsp;|&nbsp;&nbsp;
-    <span style="font-size: 16px; color: #666;">STATUS: </span>
-    <span style="font-size: 20px; font-weight: bold; color: {color};">{state}</span>
-    """
+    last_price = df_slice['Close'].iloc[-1]
+    last_ahr = df_slice['AHR999'].iloc[-1]
 
-# --- 4. 绘图与执行 ---
+    # 2. 配色方案 (专业金融风)
+    color_price = "#2c3e50"    # 深蓝灰
+    color_pred = "#8e44ad"     # 紫色 (预测线)
+    color_buy = "#27ae60"      # 绿色 (抄底)
+    color_sell = "#c0392b"     # 红色 (逃顶)
+    color_accum = "#2980b9"    # 蓝色 (定投)
 
-# 加载数据 (带进度提示)
-with st.spinner("Establishing secure connection to market data nodes..."):
-    data_source = load_all_market_data()
-
-# 检查是否全部失败
-if data_source["BTC-USD"]["df"].empty and data_source["ETH-USD"]["df"].empty:
-    st.error("❌ CRITICAL ERROR: Unable to connect to ANY market data source (Yahoo & Coingecko both failed). Please check your internet connection.")
-else:
-    # 即使部分失败，只要有一个成功也继续渲染
-    btc_valid = not data_source["BTC-USD"]["df"].empty
-    eth_valid = not data_source["ETH-USD"]["df"].empty
-    
-    btc_title = generate_header_html("BITCOIN", data_source["BTC-USD"]) if btc_valid else "BTC DATA ERROR"
-    eth_title = generate_header_html("ETHEREUM", data_source["ETH-USD"]) if eth_valid else "ETH DATA ERROR"
-
-    # 创建画布
+    # 3. 创建子图 (上:价格, 下:指标)
     fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, 
-        row_heights=[0.65, 0.35]
+        rows=2, cols=1, 
+        shared_xaxes=True, 
+        vertical_spacing=0.05, 
+        row_heights=[0.65, 0.35],
+        subplot_titles=("Price Action & Valuation Model", "Deviation Index (Market Sentiment)")
     )
 
-    # --- Group 1: BTC Traces (默认显示) ---
-    if btc_valid:
-        btc_df = data_source["BTC-USD"]["df"]
-        fig.add_trace(go.Scatter(x=btc_df.index, y=btc_df['Close'], name="BTC Price", line=dict(color="black", width=1.5), visible=True), row=1, col=1)
-        fig.add_trace(go.Scatter(x=btc_df.index, y=btc_df['GeoMean'], name="Geo-Mean", line=dict(color="#666", width=1.5, dash='dot'), visible=True), row=1, col=1)
-        fig.add_trace(go.Scatter(x=btc_df.index, y=btc_df['Predicted'], name="Power Law", line=dict(color="#800080", width=1.5, dash='dash'), visible=True), row=1, col=1)
-        fig.add_trace(go.Scatter(x=btc_df.index, y=btc_df['AHR999'], name="Deviation", line=dict(color="#d35400", width=1.5), visible=True), row=2, col=1)
-    else:
-        # 占位符，防止索引错乱
-        for _ in range(4): fig.add_trace(go.Scatter(x=[], y=[], visible=True), row=1, col=1)
+    # --- 上半部分：价格 vs 估值 ---
+    # 价格线
+    fig.add_trace(go.Scatter(x=df_slice.index, y=df_slice['Close'], name="Price",
+                             line=dict(color=color_price, width=2)), row=1, col=1)
+    # 预测线 (虚线)
+    fig.add_trace(go.Scatter(x=df_slice.index, y=df_slice['Predicted'], name="Fair Value",
+                             line=dict(color=color_pred, width=2, dash='dash')), row=1, col=1)
+    
+    # --- 下半部分：指标 (使用背景色带代替线条) ---
+    fig.add_trace(go.Scatter(x=df_slice.index, y=df_slice['AHR999'], name="Index",
+                             line=dict(color="#d35400", width=2)), row=2, col=1)
 
-    # --- Group 2: ETH Traces (默认隐藏) ---
-    if eth_valid:
-        eth_df = data_source["ETH-USD"]["df"]
-        fig.add_trace(go.Scatter(x=eth_df.index, y=eth_df['Close'], name="ETH Price", line=dict(color="black", width=1.5), visible=False), row=1, col=1)
-        fig.add_trace(go.Scatter(x=eth_df.index, y=eth_df['GeoMean'], name="Geo-Mean", line=dict(color="#666", width=1.5, dash='dot'), visible=False), row=1, col=1)
-        fig.add_trace(go.Scatter(x=eth_df.index, y=eth_df['Predicted'], name="Regression", line=dict(color="#800080", width=1.5, dash='dash'), visible=False), row=1, col=1)
-        fig.add_trace(go.Scatter(x=eth_df.index, y=eth_df['AHR999'], name="Deviation", line=dict(color="#d35400", width=1.5), visible=False), row=2, col=1)
-    else:
-        for _ in range(4): fig.add_trace(go.Scatter(x=[], y=[], visible=False), row=1, col=1)
+    # 关键优化：使用 add_hrect 添加直观的背景色带
+    # 抄底区 (<0.45)
+    fig.add_hrect(y0=0, y1=0.45, row=2, col=1, 
+                  fillcolor=color_buy, opacity=0.15, layer="below", line_width=0,
+                  annotation_text="BUY ZONE", annotation_position="top left", annotation_font_color=color_buy)
+    # 定投区 (0.45 - 1.2)
+    fig.add_hrect(y0=0.45, y1=1.2, row=2, col=1, 
+                  fillcolor=color_accum, opacity=0.1, layer="below", line_width=0,
+                  annotation_text="ACCUMULATE", annotation_position="top left", annotation_font_color=color_accum)
+    # 泡沫区 (>4.0) - 只有当数据真的触及时才显示，避免压缩视图
+    if df_slice['AHR999'].max() > 3.0:
+        fig.add_hrect(y0=4.0, y1=100, row=2, col=1, 
+                      fillcolor=color_sell, opacity=0.15, layer="below", line_width=0,
+                      annotation_text="SELL ZONE", annotation_position="bottom left", annotation_font_color=color_sell)
 
-    # 参考线
-    fig.add_hline(y=0.45, line_color="green", line_dash="dash", row=2, col=1, annotation_text="Buy")
-    fig.add_hline(y=1.2, line_color="blue", line_dash="dot", row=2, col=1, annotation_text="Accum")
-    fig.add_hline(y=4.0, line_color="red", line_dash="dash", row=2, col=1, annotation_text="Sell")
-
-    # --- 纯 Plotly 交互按钮 ---
-    updatemenus = [
-        dict(
-            type="buttons", direction="right", active=0, x=0, y=1.2,
-            buttons=list([
-                dict(label=" ₿ BTC ", method="update",
-                     args=[{"visible": [True, True, True, True, False, False, False, False]},
-                           {"title.text": btc_title}]),
-                dict(label=" ♦ ETH ", method="update",
-                     args=[{"visible": [False, False, False, False, True, True, True, True]},
-                           {"title.text": eth_title}]),
-            ]),
-            bgcolor="white", bordercolor="black", borderwidth=1,
-            font=dict(family="Courier New", size=14, color="black")
-        )
-    ]
-
+    # --- 布局优化 ---
     fig.update_layout(
-        height=850,
-        title=dict(
-            text=btc_title, # 默认标题
-            x=0.5, y=0.96, xanchor='center', yanchor='top'
-        ),
-        updatemenus=updatemenus,
         template="plotly_white",
-        font=dict(family="Times New Roman", color="black"),
-        margin=dict(t=160, l=60, r=40, b=80),
-        xaxis=dict(
-            rangeslider=dict(visible=True, borderwidth=1, bordercolor="black"),
-            type="date", showgrid=True, gridcolor="#eee", linecolor="black", mirror=True
-        ),
-        yaxis=dict(type="log", title="Price (Log)", showgrid=True, gridcolor="#eee", linecolor="black", mirror=True),
-        yaxis2=dict(title="Deviation Index", showgrid=True, gridcolor="#eee", linecolor="black", mirror=True),
-        legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center")
+        height=700,
+        margin=dict(t=50, l=50, r=50, b=50),
+        showlegend=False, # 隐藏图例，让图表更纯粹，依靠标题和颜色识别
+        title=dict(
+            text=f"<b>{ticker}</b>: ${last_price:,.0f} | <b>Index</b>: {last_ahr:.2f}",
+            x=0.05, y=0.98, xanchor='left',
+            font=dict(size=20, family="Arial")
+        )
     )
+
+    # 坐标轴设置
+    fig.update_yaxes(type="log", title="Price (USD)", row=1, col=1, gridcolor="#eee")
+    fig.update_yaxes(title="Deviation", row=2, col=1, gridcolor="#eee", zeroline=False)
+    fig.update_xaxes(showgrid=True, gridcolor="#eee")
+
+    # 输出静态图表
+    st.plotly_chart(fig, use_container_width=True, config={'staticPlot': True}) 
+
+# --- 5. 主控制面板 (Sidebar + Layout) ---
+
+# 侧边栏：全局控制
+with st.sidebar:
+    st.header("⚙️ Configuration")
     
-    fig.update_shapes(dict(line_color="black"))
+    # 1. 资产选择 (Radio比Tab更适合作为全局开关)
+    ticker_option = st.radio("Select Asset", ["BTC-USD", "ETH-USD"], index=0)
     
-    # 唯一输出
-    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+    st.divider()
+    
+    # 2. 加载数据
+    with st.spinner("Fetching Data..."):
+        df_full, source_note = get_data(ticker_option)
+    
+    # 3. 时间切片器 (独立于图表)
+    st.subheader("📅 Time Range")
+    
+    min_date = df_full.index.min().date()
+    max_date = df_full.index.max().date()
+    default_start = max_date - timedelta(days=365*4) # 默认看最近4年
+    
+    if default_start < min_date: default_start = min_date
+
+    # 滑块控件
+    date_range = st.slider(
+        "Zoom Level",
+        min_value=min_date,
+        max_value=max_date,
+        value=(default_start, max_date),
+        format="YYYY-MM-DD"
+    )
+
+    st.divider()
+    st.caption(f"Data Source: {source_note}")
+    st.caption("Mode: Static View (Non-interactive)")
+
+# --- 6. 主体显示 ---
+
+# 使用容器包裹，增加一点白色背景卡片感
+with st.container():
+    if not df_full.empty:
+        # 调用绘图函数
+        create_static_dashboard(df_full, ticker_option, date_range[0], date_range[1])
+        
+        # 底部状态解释
+        st.markdown(f"""
+        ---
+        **How to read this chart:**
+        - **Top Panel**: The <span style='color:#2c3e50'><b>Dark Line</b></span> is the actual price. The <span style='color:#8e44ad'><b>Purple Dashed Line</b></span> is the "Fair Value" model.
+        - **Bottom Panel**: The Deviation Index.
+            - <span style='color:#27ae60; background-color:#eafaf1; padding:2px 5px; border-radius:3px;'><b>Green Zone (<0.45)</b></span>: Historically the best time to buy.
+            - <span style='color:#2980b9; background-color:#ebf5fb; padding:2px 5px; border-radius:3px;'><b>Blue Zone (0.45-1.2)</b></span>: Good for Dollar Cost Averaging (DCA).
+            - <span style='color:#c0392b; background-color:#fdedec; padding:2px 5px; border-radius:3px;'><b>Red Zone (>4.0)</b></span>: Historically overheated (Sell signal).
+        """, unsafe_allow_html=True)
+    else:
+        st.error("Unable to load data. Please check your internet connection.")
+
