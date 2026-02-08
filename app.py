@@ -95,80 +95,88 @@ def get_data(ticker):
     df['AHR999'] = (df['Close'] / df['GeoMean']) * (df['Close'] / df['Predicted'])
     return df, source
 
-# --- 4. 绘图核心 (解决数据挤压问题) ---
-def create_chart(df, ticker):
-    last_price = df['Close'].iloc[-1]
-    last_ahr = df['AHR999'].iloc[-1]
-
-    # 定义颜色
-    color_price = "#000000"     # 纯黑价格线
-    color_buy = "#228b22"       # 森林绿 (买入)
-    color_accum = "#4682b4"     # 钢蓝 (定投)
-    color_sell = "#b22222"      # 火砖红 (卖出)
-
+def create_pure_chart(df):
+    # 颜色定义
+    c_price = "#000000"
+    c_buy   = "#228b22"  # 绿色
+    c_acc   = "#4682b4"  # 蓝色
+    c_sell  = "#b22222"  # 红色
+    
     # 创建子图
     fig = make_subplots(
         rows=2, cols=1, 
         shared_xaxes=True, 
-        vertical_spacing=0.03, # 缩小子图间距
-        row_heights=[0.65, 0.35],
-        subplot_titles=("Asset Price (Log Scale)", "Deviation Index (Log Scale)")
+        row_heights=[0.65, 0.35], 
+        vertical_spacing=0.03
     )
-
+    
     # --- 上图：价格 ---
-    fig.add_trace(go.Scatter(x=df.index, y=df['Close'], name="Price",
-                             line=dict(color=color_price, width=1.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['Predicted'], name="Model",
+    fig.add_trace(go.Scatter(x=df.index, y=df['Close'], name="Price", 
+                             line=dict(color=c_price, width=1.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['Predicted'], name="Model", 
                              line=dict(color="purple", width=1, dash='dash')), row=1, col=1)
     
     # --- 下图：指标 ---
-    fig.add_trace(go.Scatter(x=df.index, y=df['AHR999'], name="Deviation",
+    fig.add_trace(go.Scatter(x=df.index, y=df['AHR999'], name="Index", 
                              line=dict(color="#d35400", width=1.5)), row=2, col=1)
-
-    # --- 关键修复：背景色带 + 对数坐标适配 ---
-    # 注意：在 Log 坐标下，我们不需要画到 0，画到 0.01 即可
     
-    # 1. 抄底区 (< 0.45)
-    fig.add_hrect(y0=0.01, y1=0.45, row=2, col=1, 
-                  fillcolor=color_buy, opacity=0.1, layer="below", line_width=0)
-    fig.add_hline(y=0.45, line_width=1, line_dash="dot", line_color=color_buy, row=2, col=1, 
-                  annotation_text="BUY (0.45)", annotation_position="top left", annotation_font_color=color_buy)
+    # ------------------------------------------------------------------
+    # 核心修复区：精确控制文字位置，使其落入对应色块中
+    # ------------------------------------------------------------------
 
-    # 2. 定投区 (0.45 - 1.2)
+    # 1. 抄底区 (绿色, < 0.45)
+    # 背景色
+    fig.add_hrect(y0=0.001, y1=0.45, row=2, col=1, 
+                  fillcolor=c_buy, opacity=0.1, line_width=0, layer="below")
+    # 分界线 & 文字
+    fig.add_hline(y=0.45, row=2, col=1, 
+                  line_dash="dot", line_color=c_buy, line_width=1,
+                  annotation_text="<b>BUY ZONE (<0.45)</b>", 
+                  # 关键：Bottom Right -> 让文字位于线的下方（绿色区域内）
+                  annotation_position="bottom right",
+                  annotation_font=dict(color=c_buy, size=10))
+    
+    # 2. 定投区 (蓝色, 0.45 - 1.2)
+    # 背景色
     fig.add_hrect(y0=0.45, y1=1.2, row=2, col=1, 
-                  fillcolor=color_accum, opacity=0.1, layer="below", line_width=0)
-    fig.add_hline(y=1.2, line_width=1, line_dash="dot", line_color=color_accum, row=2, col=1, 
-                  annotation_text="ACCUM (1.2)", annotation_position="top left", annotation_font_color=color_accum)
-
-    # 3. 顶部风险区 (> 4.0)
-    fig.add_hrect(y0=4.0, y1=1000, row=2, col=1, 
-                  fillcolor=color_sell, opacity=0.1, layer="below", line_width=0)
-    fig.add_hline(y=4.0, line_width=1, line_dash="dot", line_color=color_sell, row=2, col=1, 
-                  annotation_text="HIGH (4.0)", annotation_position="bottom left", annotation_font_color=color_sell)
-
-    # --- 布局设置 ---
-    fig.update_layout(
-        template="plotly_white",
-        height=750,
-        margin=dict(t=30, l=50, r=50, b=50),
-        showlegend=False,
-        hovermode="x unified",
-        # 禁用缩放和平移，保持静态视图
-        xaxis=dict(fixedrange=True),
-        xaxis2=dict(fixedrange=True),
-        yaxis=dict(fixedrange=True),
-        yaxis2=dict(fixedrange=True)
-    )
-
-    # --- 坐标轴设置 (核心修改) ---
-    # 两个Y轴全部强制设为 log 类型
-    fig.update_yaxes(type="log", row=1, col=1, gridcolor="#f0f0f0", title="USD")
-    # 下图也设为 log，这样 0.5 到 1.0 的波动会被放大，不会被 10.0 的高点挤压成直线
-    fig.update_yaxes(type="log", row=2, col=1, gridcolor="#f0f0f0", title="Index Value") 
+                  fillcolor=c_acc, opacity=0.1, line_width=0, layer="below")
+    # 分界线 (上限 1.2) & 文字
+    fig.add_hline(y=1.2, row=2, col=1, 
+                  line_dash="dot", line_color=c_acc, line_width=1,
+                  annotation_text="<b>ACCUMULATE (0.45-1.2)</b>", 
+                  # 关键：Bottom Right -> 让文字位于1.2线的下方（蓝色区域内）
+                  annotation_position="bottom right",
+                  annotation_font=dict(color=c_acc, size=10))
     
-    fig.update_xaxes(showgrid=True, gridcolor="#f0f0f0")
+    # 3. 顶部风险区 (红色, > 4.0)
+    # 背景色
+    fig.add_hrect(y0=4.0, y1=1000, row=2, col=1, 
+                  fillcolor=c_sell, opacity=0.1, line_width=0, layer="below")
+    # 分界线 & 文字
+    fig.add_hline(y=4.0, row=2, col=1, 
+                  line_dash="dot", line_color=c_sell, line_width=1,
+                  annotation_text="<b>HIGH RISK (>4.0)</b>", 
+                  # 关键：Top Right -> 让文字位于4.0线的上方（红色区域内）
+                  annotation_position="top right",
+                  annotation_font=dict(color=c_sell, size=10))
 
-    return fig, last_price, last_ahr
+    # ------------------------------------------------------------------
+
+    # 全局 Log 坐标设置
+    fig.update_yaxes(type="log", row=1, col=1, title="Price (USD)", gridcolor="#f0f0f0")
+    fig.update_yaxes(type="log", row=2, col=1, title="Index Value", gridcolor="#f0f0f0")
+    fig.update_xaxes(showgrid=True, gridcolor="#f0f0f0")
+    
+    # 布局微调
+    fig.update_layout(
+        template="plotly_white", 
+        height=700, 
+        margin=dict(t=10, l=50, r=50, b=50), 
+        showlegend=False, 
+        xaxis_fixedrange=True, 
+        yaxis_fixedrange=True
+    )
+    return fig
 
 # --- 5. 主界面逻辑 (Top Control Layout) ---
 
